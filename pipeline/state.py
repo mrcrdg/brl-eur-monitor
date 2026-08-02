@@ -35,7 +35,7 @@ import random
 STATE_PATH = pathlib.Path(__file__).resolve().parents[1] / "data" / "_state.json"
 
 # Oldest date the pipeline will ever try to collect.
-HISTORY_START = dt.date(2024, 1, 1)
+HISTORY_START = dt.date(2026, 2, 2)
 
 # Cron slots per day in the workflow. Must match ingest.yml, or the release
 # rate will not track supply.

@@ -113,7 +113,7 @@ considerably more like a person than one with none.
 4. Settings → Actions → General → Workflow permissions → **Read and write**.
 5. Actions → `monitor` → Run workflow → mode `seed`. Start with
    `limit = 100` to confirm both APIs respond as expected before committing to
-   the full history from 2024-01-01 (about 650 dates, ~15 minutes).
+   the full history from `HISTORY_START` in `pipeline/state.py`.
 
 ## Caveats
 
