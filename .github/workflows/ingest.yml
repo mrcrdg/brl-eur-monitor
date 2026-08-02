@@ -1,0 +1,105 @@
+name: monitor
+
+on:
+  schedule:
+    # Five candidate slots a day. Most do nothing: the release queue, not the
+    # cron, decides whether anything is published. Keep this count in sync with
+    # SLOTS_PER_DAY in pipeline/state.py. Odd minutes because on-the-hour crons
+    # are heavily contended on shared runners and get delayed or dropped.
+    - cron: "17 2 * * *"
+    - cron: "43 7 * * *"
+    - cron: "29 11 * * *"
+    - cron: "51 16 * * *"
+    - cron: "13 21 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "release = normal publish, seed = backfill history"
+        type: choice
+        options: [release, seed]
+        default: release
+      hold:
+        description: "seed only: dates to leave unreleased"
+        default: "20"
+      limit:
+        description: "seed only: max dates this pass (0 = all)"
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install
+        # --locked fails rather than silently resolving something new, so a
+        # scheduled run can never publish data built with unpinned deps.
+        run: uv sync --locked
+
+      - name: Scatter the start time
+        if: github.event_name == 'schedule'
+        run: sleep $(( RANDOM % 2700 ))
+
+      - name: Identify
+        run: |
+          git config user.name  "${{ secrets.GIT_AUTHOR_NAME }}"
+          git config user.email "${{ secrets.GIT_AUTHOR_EMAIL }}"
+
+      - name: Seed history
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'seed'
+        run: |
+          uv run python -m pipeline.run seed --hold "${{ inputs.hold }}" --limit "${{ inputs.limit }}"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Nothing seeded."
+            exit 0
+          fi
+          git commit -m "data: backfill historical series"
+          git pull --rebase --autostash
+          git push
+
+      - name: Publish
+        if: github.event_name == 'schedule' || inputs.mode == 'release'
+        run: |
+          count="$(uv run python -m pipeline.run plan)"
+          echo "Release plan for this run: $count date(s)."
+          if [ "$count" -eq 0 ]; then
+            exit 0
+          fi
+
+          committed=0
+          for i in $(seq 1 "$count"); do
+            # Space multi-date runs so they do not land as a cluster of
+            # identical timestamps.
+            if [ "$i" -gt 1 ]; then
+              sleep $(( 120 + RANDOM % 600 ))
+            fi
+
+            uv run python -m pipeline.run release
+            git add data
+            if git diff --cached --quiet; then
+              echo "Nothing new to publish; stopping early."
+              break
+            fi
+            published="$(uv run python -m pipeline.run status | awk '/latest released/ {print $4}')"
+            git commit -m "data: publish $published"
+            committed=1
+          done
+
+          if [ "$committed" -eq 0 ]; then
+            exit 0
+          fi
+          git pull --rebase --autostash
+          git push
