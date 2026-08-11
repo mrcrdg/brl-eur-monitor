@@ -14,6 +14,7 @@ they disagree slightly. reconciliation.csv tracks that spread.
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -21,6 +22,47 @@ import requests
 
 TIMEOUT = 25
 HEADERS = {"User-Agent": "brl-eur-monitor/1.0 (github actions)"}
+
+# Bounded retry for transient upstream failures. Three attempts total, so the
+# worst case adds BACKOFF + 2*BACKOFF seconds before giving up.
+RETRIES = 3
+BACKOFF = 2.0
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can neutralise the backoff instead of waiting."""
+    time.sleep(seconds)
+
+
+def _get(url: str, params: dict[str, str]) -> requests.Response:
+    """GET with a bounded retry on transient failures.
+
+    Both upstreams are free public services that occasionally answer a
+    perfectly valid request with a 502; on 2026-08-11 one such blip from
+    api.bcb.gov.br killed an entire scheduled publish.
+
+    Only 5xx and connection/timeout errors are retried. A 4xx is a real answer
+    -- SGS reports an empty window as 404 -- so repeating it would just slow
+    every holiday down. Retries are exhausted, never swallowed: the final
+    attempt's response is returned as-is so raise_for_status() still fails
+    loudly, because a genuine outage must go red rather than be recorded as a
+    date with no data.
+    """
+    attempt = 0
+    delay = BACKOFF
+    while True:
+        attempt += 1
+        final = attempt >= RETRIES
+        try:
+            resp = requests.get(url, params=params, timeout=TIMEOUT, headers=HEADERS)
+        except (requests.Timeout, requests.ConnectionError):
+            if final:
+                raise
+        else:
+            if final or resp.status_code < 500:
+                return resp
+        _sleep(delay)
+        delay *= 2
 
 
 @dataclass(frozen=True)
@@ -43,11 +85,9 @@ def fetch_ecb(day: dt.date) -> tuple[dict, list[dict]]:
     # versioned its paths. The old host 301-redirects; requests follows
     # redirects by default, but pointing at the current URL avoids the extra
     # round trip and the risk of the redirect being retired.
-    resp = requests.get(
+    resp = _get(
         f"https://api.frankfurter.dev/v1/{day.isoformat()}",
-        params={"base": "EUR", "symbols": ",".join(ECB_QUOTES)},
-        timeout=TIMEOUT,
-        headers=HEADERS,
+        {"base": "EUR", "symbols": ",".join(ECB_QUOTES)},
     )
     resp.raise_for_status()
     payload = resp.json()
@@ -94,11 +134,9 @@ INDICATOR_SERIES = {
 def _sgs(code: int, day: dt.date) -> list[dict]:
     """One SGS series for one day. Returns [] when nothing was published."""
     stamp = day.strftime("%d/%m/%Y")
-    resp = requests.get(
+    resp = _get(
         SGS_URL.format(code=code),
-        params={"formato": "json", "dataInicial": stamp, "dataFinal": stamp},
-        timeout=TIMEOUT,
-        headers=HEADERS,
+        {"formato": "json", "dataInicial": stamp, "dataFinal": stamp},
     )
     # SGS answers an empty window with 404 rather than an empty list.
     if resp.status_code == 404:

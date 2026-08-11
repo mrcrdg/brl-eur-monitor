@@ -68,6 +68,35 @@ def fake_get(url: str, params=None, **_kwargs):
     return FakeResponse(200, [{"data": params["dataInicial"], "valor": value}])
 
 
+class FlakyUpstream:
+    """fake_get with a run of 5xx responses bolted in front of the SGS calls.
+
+    Counts every request so a test can prove how many attempts were made --
+    that a blip is retried, that a persistent outage stops at RETRIES, and
+    that a 404 is taken at face value.
+    """
+
+    def __init__(self, failures: float, status: int = 502):
+        self.remaining = failures
+        self.status = status
+        self.calls = 0
+
+    def __call__(self, url: str, params=None, **kwargs):
+        self.calls += 1
+        if "sgs." in url and self.remaining > 0:
+            self.remaining -= 1
+            return FakeResponse(self.status, None)
+        return fake_get(url, params, **kwargs)
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Record backoff delays instead of sleeping them; keeps the suite fast."""
+    delays: list[float] = []
+    monkeypatch.setattr(sources_mod, "_sleep", delays.append)
+    return delays
+
+
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     """Point every write at a temp dir and stub the network."""
@@ -132,6 +161,51 @@ def test_ecb_rows_are_not_misdated_on_a_holiday(project):
     """Frankfurter echoes the prior day; that must not be filed under today."""
     _payload, rows = sources_mod.fetch_ecb(next(iter(HOLIDAYS)))
     assert rows == []
+
+
+def test_transient_5xx_is_retried_and_the_date_still_lands(monkeypatch, no_backoff):
+    """One upstream blip must not lose the date.
+
+    BCB answered a valid request for series 1 with 502 on 2026-08-11 and that
+    single response failed the whole scheduled publish.
+    """
+    day = dt.date(2026, 7, 8)
+    monkeypatch.setattr(sources_mod.requests, "get", fake_get)
+    _payload, clean = sources_mod.fetch_ptax(day)
+
+    upstream = FlakyUpstream(failures=1)
+    monkeypatch.setattr(sources_mod.requests, "get", upstream)
+    _payload, rows = sources_mod.fetch_ptax(day)
+
+    assert rows == clean
+    # One extra attempt for the series that blipped, none for the other.
+    assert upstream.calls == len(sources_mod.PTAX_SERIES) + 1
+    assert no_backoff == [sources_mod.BACKOFF]
+
+
+def test_persistent_5xx_still_fails_loudly(monkeypatch, no_backoff):
+    """Retries are bounded. A real outage must go red, not record an empty date."""
+    upstream = FlakyUpstream(failures=float("inf"))
+    monkeypatch.setattr(sources_mod.requests, "get", upstream)
+
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        sources_mod.fetch_ptax(dt.date(2026, 7, 8))
+
+    assert upstream.calls == sources_mod.RETRIES
+    # Exponential, and only between attempts.
+    assert no_backoff == [sources_mod.BACKOFF, sources_mod.BACKOFF * 2]
+
+
+def test_a_404_is_answered_once_and_not_retried(monkeypatch, no_backoff):
+    """SGS reports an empty window as 404; retrying it would slow every holiday."""
+    upstream = FlakyUpstream(failures=0)
+    monkeypatch.setattr(sources_mod.requests, "get", upstream)
+
+    _payload, rows = sources_mod.fetch_ptax(next(iter(HOLIDAYS)))
+
+    assert rows == []
+    assert upstream.calls == len(sources_mod.PTAX_SERIES)
+    assert no_backoff == []
 
 
 def test_reconciliation_joins_both_publishers(project):
