@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 Working notes for AI agents in this repo. The README explains the project to a
 human reader; this file records the things that are easy to break silently.
@@ -16,28 +16,10 @@ and publishes the result to git on a randomized schedule. Two moving parts:
 The second part is cosmetic and the repo says so out loud. Keep it that way; do
 not quietly re-describe it as a data requirement.
 
-## Layout
-
-```
-pipeline/sources.py   ECB + BCB SGS fetchers; one row-set per date
-pipeline/state.py     release queue and its controller
-pipeline/run.py       CLI: plan / release / seed / status
-tests/                pytest, network stubbed
-data/                 committed output; raw/, curated/, _state.json
-```
-
 ## Commands
 
 Dependencies are managed with uv. There is no `requirements.txt`, no manual
 venv step, and no `pip install` in this project.
-
-```bash
-uv sync --all-groups
-uv run pytest
-uv run ruff check .
-uv run ruff format .
-uv run monitor status
-```
 
 Before any commit: `uv run ruff check . && uv run ruff format --check . && uv run pytest`.
 
@@ -60,7 +42,9 @@ Breaking any of these produces a repo that looks fine and is wrong.
   real work is pushed. Do not add `--date`, `GIT_AUTHOR_DATE`, or any rebase
   that rewrites timestamps.
 - **`SLOTS_PER_DAY` in `state.py` must equal the number of cron entries in
-  `.github/workflows/ingest.yml`.** The controller derives its per-slot firing
+  `.github/workflows/ingest.yml` (the workflow named `monitor`).** The file name
+  and the workflow name differ, so `gh run list` shows it as `monitor`; there is
+  no second file. The controller derives its per-slot firing
   rate from it. Change one, change the other, or the release rate stops
   tracking supply.
 - **Today's date is never fetched.** Neither publisher has closed its books;
@@ -108,8 +92,15 @@ pools 8; `test_controller_beats_the_naive_reserve_scheduler` guards the design
 choice rather than its current output.
 
 Simulation tests evaluate ~30k slots, so keep `available_dates()` cached and
-pass a precomputed `pending` into `plan_release()`. Removing either takes the
-suite from 10s to 55s.
+pass a precomputed `pending` into `plan_release()`. Measured 2026-08-11:
+dropping the cache takes the suite from ~28s to ~79s.
+
+The suite takes ~28s, essentially all of it in two tests:
+`test_controller_beats_the_naive_reserve_scheduler` (~16s, it simulates both
+the real and the naive controller 8 times each) and
+`test_release_schedule_does_not_track_the_market_calendar` (~9s). Everything
+else runs in well under a second. That cost buys pooled statistics, so do not
+"optimise" it by cutting the pool count — read the section above first.
 
 ## Adding a source
 
@@ -126,7 +117,6 @@ suite from 10s to 55s.
 
 ## Conventions
 
-- Python ≥3.12, ruff (line length 100), config in `pyproject.toml`.
 - Comments explain *why*, especially where the code works around an upstream
   quirk. Do not strip those — several encode bugs that already bit.
 - Prefer editing `state.py` constants over adding new tuning knobs.
