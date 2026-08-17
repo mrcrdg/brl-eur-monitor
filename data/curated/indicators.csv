@@ -231,3 +231,5 @@ date,indicator,value,unit,series_code
 2026-07-17,selic_target,14.2500,pct_per_year,432
 2026-07-20,ipca_monthly,0.0700,pct_per_month,433
 2026-07-20,selic_target,14.2500,pct_per_year,432
+2026-07-21,ipca_monthly,0.0700,pct_per_month,433
+2026-07-21,selic_target,14.2500,pct_per_year,432
