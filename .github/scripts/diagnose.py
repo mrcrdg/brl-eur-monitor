@@ -22,7 +22,7 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.6-flash"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
 RESPONSE_SCHEMA = {
