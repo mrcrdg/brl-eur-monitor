@@ -1,0 +1,189 @@
+name: autofix
+
+# Reacts to a failed `monitor` run: fetches the log, asks a free-tier model
+# (Gemini -- no API billing, just a free key) to classify the failure, and
+# only for a genuine code defect, proposes a fix.
+#
+# Most failures in this repo are not code defects. Of the two seen so far,
+# one was a 502 from BCB and one was BCB answering 200 with an empty body --
+# both self-healed on the next scheduled run. Neither warranted a code
+# change, so the default action is a report (a GitHub issue, which emails
+# you), not a PR.
+#
+# A code-defect fix gets a PR, and that PR auto-merges only when the guard
+# check (.github/scripts/guard.py) finds it clean: tests pass AND it doesn't
+# touch the retry/date-check/no_data logic CLAUDE.md calls out as easy to
+# break silently. Anything else is left open for a human. This mirrors what
+# `review.yml` used to check separately -- folded in here since the second
+# LLM review pass added by that file doesn't carry over cleanly to a
+# free-tier model, and the guard check covers the same ground
+# deterministically for this bot's own PRs.
+
+on:
+  workflow_run:
+    workflows: ["monitor"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "monitor run id to diagnose (defaults to the triggering run)"
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: autofix
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked --all-groups
+
+      - name: Ensure the autofix label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create autofix --description "opened by the autofix workflow" --color FBCA04 2>/dev/null || true
+
+      - name: Resolve target run
+        id: run
+        run: |
+          id="${{ github.event.inputs.run_id }}"
+          if [ -z "$id" ]; then
+            id="${{ github.event.workflow_run.id }}"
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch failure log
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view "${{ steps.run.outputs.id }}" --log-failed > failure.log
+          tail -c 12000 failure.log > failure_excerpt.log
+
+      - name: Diagnose
+        id: diagnose
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RUN_ID: ${{ steps.run.outputs.id }}
+        run: uv run python .github/scripts/diagnose.py
+
+      - name: Report only (infrastructure / transient upstream)
+        if: steps.diagnose.outputs.category != 'code_defect'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "monitor run ${{ steps.run.outputs.id }} failed: ${{ steps.diagnose.outputs.category }}" \
+            --body-file diagnosis.md \
+            --label autofix
+
+      - name: Apply the proposed fix
+        id: apply
+        if: steps.diagnose.outputs.category == 'code_defect'
+        run: |
+          applied=0
+          if [ -s patch.diff ] && git apply --check patch.diff 2>/dev/null; then
+            git apply patch.diff
+            applied=1
+          fi
+          if [ -s test.diff ] && git apply --check test.diff 2>/dev/null; then
+            git apply test.diff
+          fi
+          echo "applied=$applied" >> "$GITHUB_OUTPUT"
+
+      - name: Patch could not be applied
+        if: steps.diagnose.outputs.category == 'code_defect' && steps.apply.outputs.applied != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            cat diagnosis.md
+            echo
+            echo "The proposed patch did not apply cleanly. Attaching it for a human to finish."
+            echo '```diff'
+            cat patch.diff 2>/dev/null || echo "(no patch was produced)"
+            echo '```'
+          } > issue.md
+          gh issue create \
+            --title "monitor run ${{ steps.run.outputs.id }}: code defect found, patch needs a human" \
+            --body-file issue.md \
+            --label autofix
+
+      - name: Verify the fix
+        id: verify
+        if: steps.apply.outputs.applied == '1'
+        continue-on-error: true
+        run: uv run ruff check . && uv run ruff format --check . && uv run pytest
+
+      - name: Proposed fix failed its own tests
+        if: steps.apply.outputs.applied == '1' && steps.verify.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git checkout -- pipeline tests
+          {
+            cat diagnosis.md
+            echo
+            echo "The proposed fix did not pass \`ruff check && ruff format --check && pytest\`."
+            echo "Not opening a PR for a red fix -- attaching it for a human instead."
+            echo '```diff'
+            cat patch.diff test.diff 2>/dev/null
+            echo '```'
+          } > issue.md
+          gh issue create \
+            --title "monitor run ${{ steps.run.outputs.id }}: proposed fix failed its own tests" \
+            --body-file issue.md \
+            --label autofix
+
+      - name: Open the PR
+        id: pr
+        if: steps.apply.outputs.applied == '1' && steps.verify.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name  "${{ secrets.GIT_AUTHOR_NAME }}"
+          git config user.email "${{ secrets.GIT_AUTHOR_EMAIL }}"
+          branch="autofix/run-${{ steps.run.outputs.id }}"
+          git checkout -b "$branch"
+          git add pipeline tests
+          git commit -F diagnosis.md
+          git push -u origin "$branch"
+          url="$(gh pr create --title "autofix: run ${{ steps.run.outputs.id }}" --body-file diagnosis.md --base main --head "$branch")"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Guard check
+        id: guard
+        if: steps.pr.outcome == 'success'
+        run: uv run python .github/scripts/guard.py
+
+      - name: Auto-merge or hand off to review
+        if: steps.pr.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.guard.outputs.safe }}" = "true" ]; then
+            gh pr merge --squash --delete-branch "${{ steps.pr.outputs.url }}"
+          else
+            gh pr comment "${{ steps.pr.outputs.url }}" \
+              --body "Not auto-merging -- touches guarded logic: ${{ steps.guard.outputs.reasons }}. Needs a human look."
+          fi
