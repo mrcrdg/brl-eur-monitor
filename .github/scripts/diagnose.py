@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -24,6 +25,29 @@ import requests
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "gemini-3.6-flash"
 API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+
+# Gemini's own API is just as capable of a transient 5xx as the pipeline's
+# upstreams are (hit live during the 2026-09-17 dry run) -- so it gets the
+# same bounded retry pipeline/sources.py already applies to BCB and ECB.
+RETRIES = 3
+BACKOFF = 2.0
+
+
+def _post_with_retry(url: str, **kwargs) -> requests.Response:
+    for attempt in range(RETRIES):
+        try:
+            resp = requests.post(url, **kwargs)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == RETRIES - 1:
+                raise
+            time.sleep(BACKOFF * 2**attempt)
+            continue
+        if resp.status_code >= 500 and attempt < RETRIES - 1:
+            time.sleep(BACKOFF * 2**attempt)
+            continue
+        return resp
+    raise AssertionError("unreachable")
+
 
 RESPONSE_SCHEMA = {
     "type": "OBJECT",
@@ -154,7 +178,7 @@ def main() -> int:
     probe = probe_upstream(log)
     prompt = build_prompt(log, claude_md, probe)
 
-    resp = requests.post(
+    resp = _post_with_retry(
         API_URL,
         params={"key": os.environ["GEMINI_API_KEY"]},
         json={
